@@ -1,5 +1,3 @@
-# abap_table_migration_scan_style.py
-
 from fastapi import FastAPI
 from pydantic import BaseModel
 from typing import List, Optional, Dict, Any
@@ -10,16 +8,19 @@ app = FastAPI(
     version="1.0"
 )
 
-# --- Regexes and constants ---
-ABAP_STMT_SPLIT_RE = re.compile(r"([^.]*\.)", re.DOTALL)
-DECL_START_RE = re.compile(r"^\s*(DATA|TYPES)\s*:", re.IGNORECASE)
-
+# --- Constants for CIN tables ---
 TABLES_CIN = {"J_1IMOCUST", "J_1IMOVEND"}
 OLD_TO_NEW_TABLE_MAP = {
-    "J_1IMOCUST": {"new_table": "KNA1", "key_field": "KUNNR"},
-    "J_1IMOVEND": {"new_table": "LFA1", "key_field": "LIFNR"},
+    "J_1IMOCUST": {"new_table": "KNA1"},
+    "J_1IMOVEND": {"new_table": "LFA1"},
 }
-CIN_OLD_FIELDS = {"VEN_CLASS", "J_1IPANNO", "J_1IEXCIVE"}
+
+# --- Regex for any keyword or literal usage, all statement types (SELECT, UPDATE, JOIN, declarations, etc) ---
+# This will catch direct table use even outside a SELECT!
+TABLE_LITERAL_RE = re.compile(
+    r'\b(' + '|'.join(map(re.escape, TABLES_CIN)) + r')\b',
+    re.IGNORECASE
+)
 
 # --- Pydantic Models ---
 class Finding(BaseModel):
@@ -76,203 +77,61 @@ def pack_finding(unit: Unit, issue_type, message, severity, start, end, suggesti
     }
 
 # --- Core logic as scanner ---
-def migrate_cin_table(stmt: str, table: str) -> str:
+def migrate_table_literal(table: str) -> str:
     table_up = table.upper()
-    if table_up not in OLD_TO_NEW_TABLE_MAP:
-        return stmt  # no change
+    if table_up in OLD_TO_NEW_TABLE_MAP:
+        new_table = OLD_TO_NEW_TABLE_MAP[table_up]["new_table"]
+        msg = (
+            f"Obsolete table '{table_up}' detected. "
+            f"Replace it with '{new_table}' as per SAP Note 2877717 and review field mapping."
+        )
+        suggestion = (
+            f"Replace '{table_up}' with '{new_table}' "
+            f"and adapt code logic per SAP BP Table migration. Please check all related joins, fields, and conditions."
+        )
+        return msg, suggestion
+    return None, None
 
-    mapping = OLD_TO_NEW_TABLE_MAP[table_up]
-    new_table = mapping["new_table"]
-
-    todo_msg = (
-        f"* TODO (SAP Note 2877717): Replace direct usage of {table_up} with "
-        f"{new_table} as per SAP recommendations. Map required fields accordingly."
-    )
-
-    updated_stmt = re.sub(
-        rf"\b{table_up}\b",
-        new_table,
-        stmt,
-        flags=re.IGNORECASE,
-    )
-
-    if "SELECT" in stmt.upper():
-        field_section = re.search(r"SELECT\s+(.*?)\s+FROM\b", stmt, re.IGNORECASE | re.DOTALL)
-        if field_section:
-            fields_str = field_section.group(1)
-            fields = [f.strip().split()[0] for f in fields_str.split(",")]
-            removed_fields = [f for f in fields if f.upper() in CIN_OLD_FIELDS]
-            if removed_fields:
-                todo_msg += (
-                    f" Review field(s): {', '.join(removed_fields)}. "
-                    f"Map these to corresponding fields from {new_table}."
-                )
-
-    if "JOIN" in stmt.upper():
-        todo_msg += " Review all join conditions and migrate CIN table joins according to Note 2877717."
-        return f"{todo_msg}\n{updated_stmt.strip()}"
-
-    return f"{todo_msg}\n{updated_stmt.strip()}"
-
-def migrate_declaration(decl: str) -> Optional[str]:
-    text = decl.strip()
-    type_ref_re = re.compile(r"\bTYPE\s+(J_1IMOCUST|J_1IMOVEND)(?:-(\w+))?", re.IGNORECASE)
-
-    matches = list(type_ref_re.finditer(text))
-    if not matches:
-        return None
-
-    todo_msgs = []
-    for m in matches:
-        old_table = m.group(1).upper()
-        field = m.group(2).upper() if m.group(2) else None
-        new_table = OLD_TO_NEW_TABLE_MAP[old_table]["new_table"]
-        if re.search(r"\bBEGIN\s+OF\b", text, re.IGNORECASE):
-            todo_msgs.append(
-                f"* TODO (SAP Note 2877717): Replace structure field usage of {old_table}"
-                f"{('-' + field) if field else ''} with equivalent field from {new_table}"
-                f"{('-' + field) if field else ''}."
-            )
-        else:
-            todo_msgs.append(
-                f"* TODO (SAP Note 2877717): Replace {old_table}"
-                f"{('-' + field) if field else ''} with {new_table}"
-                f"{('-' + field) if field else ''}."
-            )
-    def _sub(m):
-        old_table = m.group(1).upper()
-        field = m.group(2).upper() if m.group(2) else None
-        new_table = OLD_TO_NEW_TABLE_MAP[old_table]["new_table"]
-        return f"TYPE {new_table}{('-' + field) if field else ''}"
-
-    new_text = type_ref_re.sub(_sub, text)
-    return ("\n".join(todo_msgs) + "\n" + new_text).strip()
-
-def iter_statements_with_offsets(src: str):
-    buf = []
-    start = 0
-    for i, ch in enumerate(src):
-        buf.append(ch)
-        if ch == ".":
-            yield "".join(buf), start, i + 1
-            buf = []
-            start = i + 1
-    if buf:
-        yield "".join(buf), start, len(src)
-
-def iter_declarations_with_offsets(src: str):
-    # Yields (decl-string, start, end)
-    lines = src.splitlines(keepends=True)
-    n = len(lines)
-    i = 0
-    pos = 0
-    while i < n:
-        line = lines[i]
-        # Simple DATA:/TYPES:
-        if DECL_START_RE.match(line):
-            buf = [line]
-            end_rel = len(line)
-            j = i
-            # Struct?
-            if re.search(r"\bBEGIN\s+OF\b", line, re.IGNORECASE):
-                while j + 1 < n:
-                    j += 1
-                    buf.append(lines[j])
-                    end_rel += len(lines[j])
-                    if re.search(r"\bEND\s+OF\s+\w+\s*\.\s*$", lines[j], re.IGNORECASE):
-                        break
-            else:
-                while j + 1 < n and not re.search(r"\.\s*$", lines[j], re.IGNORECASE):
-                    j += 1
-                    buf.append(lines[j])
-                    end_rel += len(lines[j])
-                    if re.search(r"\.\s*$", lines[j], re.IGNORECASE):
-                        break
-            full = "".join(buf)
-            yield full, pos, pos+end_rel
-            i = j + 1
-            pos += end_rel
-            continue
-        i += 1
-        pos += len(line)
-
-# --- The actual scan ---
 def scan_unit(unit_idx: int, unit: Unit) -> Dict[str, Any]:
     src = unit.code or ""
-    findings: List[Dict[str, Any]] = []
+    findings = []
 
-    # 1. Table-use statements (SELECT/INSERT/UPDATE/MODIFY)
-    for stmt, s_off, s_end in iter_statements_with_offsets(src):
-        # Look for statements referencing CIN tables
-        # Simple: look for FROM/JOIN/INTO/UPDATE/MODIFY + table
-        found = False
-        for t in TABLES_CIN:
-            if re.search(rf"\b(FROM|JOIN|INTO|UPDATE|MODIFY)\s+{t}\b", stmt, re.IGNORECASE):
-                found = True
-                break
-            # or, if table appears at any position (insert, e.g.)
-            if re.search(rf"\b{t}\b", stmt, re.IGNORECASE):
-                found = True
-                break
-        if not found:
-            continue
+    # Search for all table literals (catching use in SELECT/JOIN/UPDATE, and as declarations)
+    for m in TABLE_LITERAL_RE.finditer(src):
+        table = m.group(1).upper()
+        msg, suggestion = migrate_table_literal(table)
+        # Gather the full statement or declaration where it occurs, for better snippet context
+        # Look back for start-of-line, forward to semicolon/dot/newline/etc for snippet
+        stmt_start = src.rfind('\n', 0, m.start())
+        stmt_start = stmt_start + 1 if stmt_start != -1 else 0
+        stmt_end_dot = src.find('.', m.end())
+        stmt_end_nl = src.find('\n', m.end())
+        if stmt_end_dot == -1: stmt_end_dot = len(src)
+        if stmt_end_nl == -1: stmt_end_nl = len(src)
+        stmt_end = min(stmt_end_dot, stmt_end_nl)
+        snippet = src[stmt_start:stmt_end+1].strip()
+        findings.append(pack_finding(
+            unit,
+            "CinTableUsage",
+            msg,
+            "error",
+            m.start(),
+            m.end(),
+            suggestion,
+            {"table": table, "offset": m.start()},
+        ))
 
-        # Which table?
-        table_match = None
-        for t in TABLES_CIN:
-            if re.search(rf"\b{t}\b", stmt, re.IGNORECASE):
-                table_match = t
-                break
-
-        if not table_match:
-            continue
-
-        # Run migration logic for message & suggestion
-        suggested = migrate_cin_table(stmt, table_match)
-        if suggested != stmt:
-            msg = f"Direct usage of CIN table {table_match}."
-            findings.append(pack_finding(
-                unit,
-                "CinTableDirectUsage",
-                msg,
-                "error",
-                s_off,
-                s_end,
-                "Migrate to BP master data tables (see SAP Note 2877717).\n" + suggested,
-                {"table": table_match}
-            ))
-
-    # 2. Declarations referencing CIN tables
-    for decl, d_off, d_end in iter_declarations_with_offsets(src):
-        # Only process DATA:/TYPES: with CIN table type references
-        m = re.search(r"\bTYPE\s+(J_1IMOCUST|J_1IMOVEND)\b", decl, re.IGNORECASE)
-        if not m:
-            continue
-        migrated = migrate_declaration(decl)
-        if migrated and migrated != decl:
-            tbl = m.group(1).upper()
-            findings.append(pack_finding(
-                unit,
-                "CinTableTypeReference",
-                f"Declaration references CIN table type {tbl}.",
-                "error",
-                d_off,
-                d_end,
-                f"Change referenced type to BP table (per SAP Note 2877717):\n{migrated}",
-                {"table": tbl}
-            ))
-
-    # Return unit + findings
     res = unit.model_dump()
-    res["cin_migration_findings"] = findings
+    if findings:
+        res["cin_migration_findings"] = findings
+    else:
+        res["cin_migration_findings"] = []
     return res
 
-# --- Orchestrator ---
 def analyze_units(units: List[Unit]) -> List[Dict[str, Any]]:
     out = []
     for idx, u in enumerate(units):
         res = scan_unit(idx, u)
-        # Only include unit if findings present
         if res.get("cin_migration_findings"):
             out.append(res)
     return out
